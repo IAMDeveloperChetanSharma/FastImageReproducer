@@ -1,12 +1,33 @@
-# Resolve react_native_pods.rb with node to allow for hoisting
-require Pod::Executable.execute_command('node', ['-p',
-  'require.resolve(
-    "react-native/scripts/react_native_pods.rb",
-    {paths: [process.argv[1]]},
-  )', __dir__]).strip
+def node_require(script)
+  # Resolve script with node to allow for hoisting
+  require Pod::Executable.execute_command('node', ['-p',
+    "require.resolve(
+      '#{script}',
+      {paths: [process.argv[1]]},
+    )", __dir__]).strip
+end
 
-platform :ios, min_ios_version_supported
-prepare_react_native_project!
+node_require('react-native/scripts/react_native_pods.rb')
+node_require('react-native-permissions/scripts/setup.rb')
+
+# Use this property to enable support to the new architecture.
+ENV['RCT_NEW_ARCH_ENABLED'] = '1'
+
+if %r{^0$}i.match ENV['NO_FLIPPER']
+  # https://github.com/invertase/react-native-firebase/issues/6425#issuecomment-1527949355
+  pod 'FirebaseCore', :modular_headers => true
+  pod 'FirebaseCoreExtension', :modular_headers => true
+  pod 'FirebaseInstallations', :modular_headers => true
+  pod 'GoogleDataTransport', :modular_headers => true
+  pod 'GoogleUtilities', :modular_headers => true
+  pod 'nanopb', :modular_headers => true
+  $RNFirebaseAsStaticFramework = true
+else
+  use_frameworks! :linkage => :static
+end
+
+platform :ios, '16.0'
+install! 'cocoapods', :deterministic_uuids => false
 
 linkage = ENV['USE_FRAMEWORKS']
 if linkage != nil
@@ -14,17 +35,46 @@ if linkage != nil
   use_frameworks! :linkage => linkage.to_sym
 end
 
-target 'ReproducerApp' do
+target 'cultureapp' do
+  # Set OpenSSL Version, to mitigate an issue with react-native-quick-crypto and OpenSSL 3
+  # https://github.com/margelo/react-native-quick-crypto/issues/189
+  pod "OpenSSL-Universal", "1.1.1100"
+
+  setup_permissions(['LocationAccuracy', 'LocationAlways', 'LocationWhenInUse', 'Notifications'])
+
   config = use_native_modules!
 
   use_react_native!(
     :path => config[:reactNativePath],
+    # Enables Flipper.
+    #
+    # Note that if you have use_frameworks! enabled, Flipper will not work and
+    # you should disable the next line.
     # An absolute path to your application root.
     :app_path => "#{Pod::Config.instance.installation_root}/.."
   )
 
   post_install do |installer|
-    # https://github.com/facebook/react-native/blob/main/packages/react-native/scripts/react_native_pods.rb#L197-L202
+    bitcode_strip_path = `xcrun --find bitcode_strip`.chop!
+
+    def strip_bitcode_from_framework(bitcode_strip_path, framework_pattern)
+      framework_paths = Dir.glob(framework_pattern)
+      if framework_paths.empty?
+        puts "⚠️ No matching frameworks found for pattern: #{framework_pattern}"
+      else
+        framework_paths.each do |framework_path|
+          command = "#{bitcode_strip_path} #{framework_path} -r -o #{framework_path}"
+          puts "🔧 Stripping bitcode: #{command}"
+          system(command)
+        end
+      end
+    end
+
+    # Using wildcard to find OpenSSL framework dynamically
+    framework_pattern = "Pods/OpenSSL-Universal/**/OpenSSL.framework/OpenSSL"
+    
+    strip_bitcode_from_framework(bitcode_strip_path, framework_pattern)
+    
     react_native_post_install(
       installer,
       config[:reactNativePath],
